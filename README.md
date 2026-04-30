@@ -1,0 +1,1 @@
+# Availity-claim-status-checker
