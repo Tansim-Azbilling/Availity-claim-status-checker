@@ -161,7 +161,7 @@ REQUIRED_COLUMNS = [
 # Columns appended to the dataframe to hold automation output.
 OUTPUT_COLUMNS = [
     'Claim ID', 'Billed Amount', 'Paid Amount', 'Claim Status',
-    'Denial Reason', 'Finalized Date', 'Check Number', 'Check Date',
+    'Denial Reason', 'Last Action Taken', 'Finalized Date', 'Check Number', 'Check Date',
 ]
 STATUS_COLUMNS = ['AutomationStatus', 'LastError']
 
@@ -690,6 +690,10 @@ def load_csv(file_path):
 
 def add_output_columns(df):
     """Append OUTPUT_COLUMNS to df with empty defaults where they don't exist."""
+    # Backward compatibility: normalize old header casing if present.
+    if 'Last action taken' in df.columns and 'Last Action Taken' not in df.columns:
+        df = df.rename(columns={'Last action taken': 'Last Action Taken'})
+
     for col in OUTPUT_COLUMNS + STATUS_COLUMNS:
         if col not in df.columns:
             df[col] = ''
@@ -713,6 +717,10 @@ def save_results(df, output_folder):
     try:
         path = get_output_file_path(output_folder)
         export_df = df.drop(columns=['Last_Name', 'First_Name'], errors='ignore')
+        output_cols = [c for c in OUTPUT_COLUMNS if c in export_df.columns]
+        status_cols = [c for c in STATUS_COLUMNS if c in export_df.columns]
+        base_cols = [c for c in export_df.columns if c not in output_cols + status_cols]
+        export_df = export_df[base_cols + output_cols + status_cols]
         export_df.to_csv(path, index=False)
         log_to_gui(f"  💾 Saved: {path}\n", "info")
         return path
@@ -731,6 +739,75 @@ def safe_mark_row_status(df, row_index, status, err=''):
     """Safely update row processing status columns."""
     df.at[row_index, 'AutomationStatus'] = status
     df.at[row_index, 'LastError'] = err
+
+
+def _normalized_text(value):
+    """Return a stripped lowercase string suitable for key matching."""
+    if pd.isna(value):
+        return ''
+    return str(value).strip().lower()
+
+
+def _resolve_last_action_column(columns):
+    """Return the source 'Last Action Taken' column from a previous report."""
+    by_normalized = {str(col).strip().lower(): col for col in columns}
+    return by_normalized.get('last action taken')
+
+
+def copy_last_action_taken(df, last_report_path):
+    """Copy previous report actions into current df by AltPatientID+InvoiceNumber.
+
+    Returns (ok, error_message). If last_report_path is empty, no-op success.
+    """
+    if not last_report_path:
+        return True, ''
+
+    try:
+        last_df = pd.read_csv(last_report_path)
+    except Exception as e:
+        return False, f"Could not read Last Collection Report: {e}"
+
+    required = ['AltPatientID', 'InvoiceNumber']
+    missing = [c for c in required if c not in last_df.columns]
+    if missing:
+        return False, (
+            "Last Collection Report is missing required columns: "
+            + ', '.join(missing)
+        )
+
+    source_col = _resolve_last_action_column(last_df.columns)
+    if not source_col:
+        return False, "Last Collection Report is missing required column: Last Action Taken"
+
+    if 'Last Action Taken' not in df.columns:
+        df['Last Action Taken'] = ''
+
+    last_lookup = {}
+    for _, row in last_df.iterrows():
+        key = (
+            _normalized_text(row.get('AltPatientID', '')),
+            _normalized_text(row.get('InvoiceNumber', '')),
+        )
+        if not key[0] or not key[1]:
+            continue
+        val = row.get(source_col, '')
+        last_lookup[key] = '' if pd.isna(val) else str(val).strip()
+
+    matched = 0
+    for idx in range(len(df)):
+        key = (
+            _normalized_text(df.at[idx, 'AltPatientID']) if 'AltPatientID' in df.columns else '',
+            _normalized_text(df.at[idx, 'InvoiceNumber']) if 'InvoiceNumber' in df.columns else '',
+        )
+        if key in last_lookup:
+            df.at[idx, 'Last Action Taken'] = last_lookup[key]
+            matched += 1
+
+    log_to_gui(
+        f"✓ Last action copy complete. Matched {matched} row(s) from previous report.\n",
+        "success",
+    )
+    return True, ''
 
 
 # ============================================================================
@@ -1441,9 +1518,12 @@ def format_multi_claim_results(results):
     """
     if not results:
         return empty_claim_result('No data')
+    merged_fields = [f for f in OUTPUT_COLUMNS if f != 'Last Action Taken']
+    if len(results) == 1:
+        return {field: results[0].get(field, '--') for field in merged_fields}
     return {
-        field: '\n'.join(f"{i + 1}. {r[field]}" for i, r in enumerate(results))
-        for field in OUTPUT_COLUMNS
+        field: '\n'.join(f"{i + 1}. {r.get(field, '--')}" for i, r in enumerate(results))
+        for field in merged_fields
     }
 
 
@@ -1558,7 +1638,7 @@ def _reload_and_navigate(page, payer_config):
 # SECTION 17 — BATCH PROCESSING
 # ============================================================================
 
-def process_batch(batch_size, csv_path, output_folder, payer_name):
+def process_batch(batch_size, csv_path, output_folder, payer_name, last_report_path=''):
     """Main entry point for the background worker thread.
 
     Orchestrates: browser setup → initial navigation → CSV load + validation
@@ -1605,6 +1685,10 @@ def process_batch(batch_size, csv_path, output_folder, payer_name):
             return
 
         df = add_output_columns(df)
+        ok, copy_err = copy_last_action_taken(df, last_report_path)
+        if not ok:
+            log_to_gui(f"❌ {copy_err}\n", "error")
+            return
         log_to_gui(f"✓ Loaded {len(df)} rows\n", "success")
 
         pending_indices = [
@@ -1696,11 +1780,11 @@ def _record_error(df, row_index, error_counts):
 # SECTION 18 — BACKGROUND THREAD
 # ============================================================================
 
-def run_in_background(batch_size, csv_path, output_folder, payer):
+def run_in_background(batch_size, csv_path, output_folder, payer, last_report_path=''):
     """Spawn a daemon thread so the Tkinter main loop stays responsive."""
     thread = threading.Thread(
         target=process_batch,
-        args=(batch_size, csv_path, output_folder, payer),
+        args=(batch_size, csv_path, output_folder, payer, last_report_path),
         daemon=True,
     )
     thread.start()
@@ -1747,6 +1831,7 @@ def reset_ui_state(clear_all=False):
         if clear_all:
             collection_file_var.set("")
             output_folder_var.set("")
+            last_collection_report_var.set("")
             batch_size_var.set("10")
             payer_var.set("Healthfirst")
             log_text.config(state="normal")
@@ -1773,12 +1858,23 @@ def browse_folder():
         output_folder_var.set(folder)
 
 
+def browse_last_collection_report():
+    """Open a file picker for the optional Last Collection Report CSV."""
+    filename = filedialog.askopenfilename(
+        title="Select Last Collection Report (Optional)",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    if filename:
+        last_collection_report_var.set(filename)
+
+
 def validate_and_start():
     """Validate all inputs before starting the background automation."""
     global is_running
 
     csv_file   = collection_file_var.get()
     output_dir = output_folder_var.get()
+    last_report = last_collection_report_var.get().strip()
     payer      = payer_var.get()
 
     try:
@@ -1807,7 +1903,7 @@ def validate_and_start():
     log_text.delete(1.0, tk.END)
     log_text.config(state="disabled")
 
-    run_in_background(batch, csv_file, output_dir, payer)
+    run_in_background(batch, csv_file, output_dir, payer, last_report)
 
 
 def request_stop():
@@ -1825,7 +1921,8 @@ def request_stop():
 def create_gui():
     """Build and return the main application window."""
     global root, log_text, start_button, stop_button
-    global collection_file_var, output_folder_var, batch_size_var, payer_var
+    global collection_file_var, output_folder_var, last_collection_report_var
+    global batch_size_var, payer_var
 
     root = tk.Tk()
     root.title("Availity Claim Automation")
@@ -1833,6 +1930,7 @@ def create_gui():
 
     collection_file_var = tk.StringVar()
     output_folder_var   = tk.StringVar()
+    last_collection_report_var = tk.StringVar()
     batch_size_var      = tk.StringVar(value="10")
     payer_var           = tk.StringVar(value="Healthfirst")
 
@@ -1853,25 +1951,30 @@ def create_gui():
     tk.Entry(main_frame, textvariable=output_folder_var, width=50).grid(row=2, column=1, pady=5, padx=5)
     tk.Button(main_frame, text="Browse", command=browse_folder).grid(row=2, column=2, pady=5)
 
-    # Row 3 — Batch size
-    tk.Label(main_frame, text="Claim Search Limit", font=("Arial", 10)).grid(row=3, column=0, sticky="w", pady=5)
-    tk.Entry(main_frame, textvariable=batch_size_var, width=20).grid(row=3, column=1, sticky="w", pady=5, padx=5)
+    # Row 3 — Optional last collection report
+    tk.Label(main_frame, text="Last Collection Report:", font=("Arial", 10)).grid(row=3, column=0, sticky="w", pady=5)
+    tk.Entry(main_frame, textvariable=last_collection_report_var, width=50).grid(row=3, column=1, pady=5, padx=5)
+    tk.Button(main_frame, text="Browse", command=browse_last_collection_report).grid(row=3, column=2, pady=5)
 
-    # Row 4 — Payer dropdown
+    # Row 4 — Batch size
+    tk.Label(main_frame, text="Claim Search Limit", font=("Arial", 10)).grid(row=4, column=0, sticky="w", pady=5)
+    tk.Entry(main_frame, textvariable=batch_size_var, width=20).grid(row=4, column=1, sticky="w", pady=5, padx=5)
+
+    # Row 5 — Payer dropdown
     # Populated from PAYER_CONFIG.keys() so adding a new payer entry above
     # automatically makes it appear in the dropdown with no extra code.
-    tk.Label(main_frame, text="Select Payer:", font=("Arial", 10)).grid(row=4, column=0, sticky="w", pady=5)
+    tk.Label(main_frame, text="Select Payer:", font=("Arial", 10)).grid(row=5, column=0, sticky="w", pady=5)
     ttk.Combobox(
         main_frame,
         textvariable=payer_var,
         values=list(PAYER_CONFIG.keys()),
         state="readonly",
         width=47,
-    ).grid(row=4, column=1, sticky="w", pady=5, padx=5)
+    ).grid(row=5, column=1, sticky="w", pady=5, padx=5)
 
-    # Row 5 — Start / Stop buttons
+    # Row 6 — Start / Stop buttons
     btn_frame = tk.Frame(main_frame)
-    btn_frame.grid(row=5, column=0, columnspan=3, pady=20)
+    btn_frame.grid(row=6, column=0, columnspan=3, pady=20)
 
     start_button = tk.Button(
         btn_frame, text="Start", command=validate_and_start,
@@ -1885,13 +1988,13 @@ def create_gui():
     )
     stop_button.pack(side=tk.LEFT, padx=10)
 
-    # Rows 6-7 — Log output
+    # Rows 7-8 — Log output
     tk.Label(main_frame, text="Log:", font=("Arial", 10, "bold")).grid(
-        row=6, column=0, sticky="w", pady=(10, 5)
+        row=7, column=0, sticky="w", pady=(10, 5)
     )
 
     log_frame = tk.Frame(main_frame)
-    log_frame.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=5)
+    log_frame.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=5)
 
     scrollbar = tk.Scrollbar(log_frame)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1907,7 +2010,7 @@ def create_gui():
     log_text.tag_config("success", foreground="green")
     log_text.tag_config("error",   foreground="red")
 
-    main_frame.grid_rowconfigure(7, weight=1)
+    main_frame.grid_rowconfigure(8, weight=1)
     main_frame.grid_columnconfigure(1, weight=1)
 
     return root
