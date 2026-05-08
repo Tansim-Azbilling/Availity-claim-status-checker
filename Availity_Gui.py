@@ -1,11 +1,12 @@
 import os
+import shutil
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import pandas as pd
 import threading
 import time
 import random
-from datetime import datetime
 import traceback
 from playwright.sync_api import sync_playwright
 
@@ -20,6 +21,13 @@ from playwright.sync_api import sync_playwright
 
 is_running        = False
 current_playwright = None   # kept here so cleanup_browser() can always stop it
+current_browser = None
+managed_edge_process = None
+browser_owned_by_app = False
+
+AVAILITY_NAVIGATION_URL = "https://essentials.availity.com/static/web/onb/onboarding-ui-apps/navigation/#/"
+AVAILITY_LOGIN_URL = "https://essentials.availity.com/static/public/onb/onboarding-ui-apps/availity-fr-ui/#/login"
+CDP_ENDPOINT = "http://localhost:9222"
 
 
 # ============================================================================
@@ -113,9 +121,7 @@ PAYER_CONFIG = {
     },
     'Integra': {
         'url': (
-            "https://essentials.availity.com/static/web/onb/onboarding-ui-apps/navigation/"
-            "#/loadApp/?appUrl=%2Fstatic%2Fweb%2Fpost%2Fcs%2Fenhanced-claim-status-ui%2F"
-            "%23%2Fdashboard%3ForgId%3D34974655%26payerId%3D80141T%26activeTab%3Dby276"
+            "https://essentials.availity.com/static/web/onb/onboarding-ui-apps/navigation/#/loadApp/?appUrl=%2Fstatic%2Fweb%2Fpost%2Fcs%2Fenhanced-claim-status-ui%2F%23%2Fdashboard%3ForgId%3D34974655%26payerId%3D803%26activeTab%3Dby276"
         ),
         'uses_hipaa_tab':  True,
         'uses_line_level': True,
@@ -157,6 +163,7 @@ OUTPUT_COLUMNS = [
     'Claim ID', 'Billed Amount', 'Paid Amount', 'Claim Status',
     'Denial Reason', 'Finalized Date', 'Check Number', 'Check Date',
 ]
+STATUS_COLUMNS = ['AutomationStatus', 'LastError']
 
 # Error labels written into Claim Status when a row cannot be processed.
 # Used by _record_error() to build the end-of-batch summary.
@@ -244,6 +251,46 @@ def normalize_date_range(date_str):
         return date_str
 
 
+def normalize_dob(dob_str):
+    """Normalize DOB to MM/DD/YYYY for Availity form input.
+
+    Handles common CSV quirks:
+    - ISO/Timestamp-like values (e.g. 1969-05-11, 1969-05-11 00:00:00)
+    - Excel serial dates
+    - 3-digit years where leading '1' is dropped (e.g. 05/11/969)
+    """
+    s = str(dob_str).strip()
+    if not s or s.lower() == 'nan':
+        return ''
+
+    # Excel date serial (days from 1899-12-30)
+    if s.isdigit() and len(s) <= 5:
+        try:
+            dt = pd.to_datetime('1899-12-30') + pd.to_timedelta(int(s), unit='D')
+            return dt.strftime('%m/%d/%Y')
+        except Exception:
+            pass
+
+    # Heuristic for malformed year like 05/11/969 -> 05/11/1969
+    try:
+        parts = s.replace('-', '/').split('/')
+        if len(parts) == 3:
+            mm, dd, yy = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if len(yy) == 3 and yy.isdigit():
+                s = f"{mm}/{dd}/1{yy}"
+    except Exception:
+        pass
+
+    try:
+        dt = pd.to_datetime(s, errors='coerce')
+        if pd.notna(dt):
+            return dt.strftime('%m/%d/%Y')
+    except Exception:
+        pass
+
+    return normalize_date(s)
+
+
 def parse_amount(amount_str):
     """Parse a currency string like '$1,234.50' to float, or None if blank.
 
@@ -310,24 +357,24 @@ def empty_claim_result(status='Not found'):
 # ============================================================================
 
 def setup_browser():
-    """Connect to a running Chrome instance via CDP and return its first page.
-
-    Chrome must already be running with remote debugging enabled:
-        chrome.exe --remote-debugging-port=9222
-
-    Raises PlaywrightError if the browser is not reachable at that port.
-    """
-    global current_playwright
+    """Connect to a CDP-enabled Edge instance and return its first page."""
+    global current_playwright, current_browser
     current_playwright = sync_playwright().start()
-    browser  = current_playwright.chromium.connect_over_cdp("http://localhost:9222")
-    context  = browser.contexts[0]
-    # Reuse the existing open tab rather than forcing a new blank one
+
+    current_browser = retry_with_backoff(
+        "Connect to CDP",
+        lambda: current_playwright.chromium.connect_over_cdp(CDP_ENDPOINT),
+        attempts=10,
+        base_delay=0.8,
+        max_delay=3.0,
+    )
+    context = current_browser.contexts[0] if current_browser.contexts else current_browser.new_context()
     return context.pages[0] if context.pages else context.new_page()
 
 
-def cleanup_browser():
-    """Stop the Playwright connection.  Safe to call even if setup never ran."""
-    global current_playwright
+def disconnect_browser_session():
+    """Detach Playwright from the browser without closing Edge itself."""
+    global current_playwright, current_browser
     if current_playwright:
         try:
             current_playwright.stop()
@@ -335,6 +382,288 @@ def cleanup_browser():
             log_to_gui(f"  ⚠️ Browser cleanup error: {e}\n", "error")
         finally:
             current_playwright = None
+            current_browser = None
+
+
+def get_live_page(preferred_page=None):
+    """Return a non-closed page, preferring the supplied page when valid."""
+    if preferred_page is not None:
+        try:
+            if not preferred_page.is_closed():
+                return preferred_page
+        except Exception:
+            pass
+
+    pages = _get_all_open_pages(preferred_page)
+
+    for p in reversed(pages):
+        try:
+            if not p.is_closed():
+                return p
+        except Exception:
+            continue
+    raise RuntimeError("No live browser page available")
+
+
+def _find_edge_executable():
+    """Return a valid Edge executable path, or None if not found."""
+    edge_candidates = [
+        shutil.which("msedge"),
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for path in edge_candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def ensure_edge_with_cdp():
+    """Launch Edge with CDP enabled when needed."""
+    global managed_edge_process, browser_owned_by_app
+    if managed_edge_process and managed_edge_process.poll() is None:
+        log_to_gui("ℹ️ Reusing Edge process launched by automation\n", "info")
+        return True
+
+    edge_exe = _find_edge_executable()
+    if not edge_exe:
+        log_to_gui("❌ Microsoft Edge executable not found.\n", "error")
+        return False
+
+    args = [
+        edge_exe,
+        "--remote-debugging-port=9222",
+        AVAILITY_LOGIN_URL,
+    ]
+    try:
+        managed_edge_process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        browser_owned_by_app = True
+        log_to_gui("🟢 Opened Edge with CDP on localhost:9222 (default profile)\n", "success")
+        return True
+    except Exception as e:
+        log_to_gui(f"❌ Could not launch Edge: {e}\n", "error")
+        return False
+
+
+def close_managed_edge_if_owned():
+    """Close Edge only if this automation launched it."""
+    global managed_edge_process, browser_owned_by_app
+    if browser_owned_by_app and managed_edge_process and managed_edge_process.poll() is None:
+        try:
+            managed_edge_process.terminate()
+            managed_edge_process.wait(timeout=10)
+            log_to_gui("🛑 Closed managed Edge browser\n", "info")
+        except Exception:
+            try:
+                managed_edge_process.kill()
+            except Exception:
+                pass
+        finally:
+            managed_edge_process = None
+            browser_owned_by_app = False
+
+
+def is_logged_in_navigation(url):
+    """Return True when URL indicates logged-in Availity navigation shell."""
+    if not isinstance(url, str):
+        return False
+    normalized = url.strip().lower()
+    return "essentials.availity.com/static/web/onb/onboarding-ui-apps/navigation/" in normalized
+
+
+def _get_open_page_urls(candidate_page):
+    """Best-effort snapshot of open page URLs for login diagnostics."""
+    pages = _get_all_open_pages(candidate_page)
+    urls = []
+    for p in pages:
+        try:
+            if not p.is_closed():
+                urls.append(p.url)
+        except Exception:
+            continue
+    return urls
+
+
+def _get_all_open_pages(candidate_page=None):
+    """Return deduplicated open pages from current and browser-wide contexts."""
+    pages = []
+    seen_ids = set()
+
+    def _add(page):
+        try:
+            if page is None or page.is_closed():
+                return
+            pid = id(page)
+            if pid in seen_ids:
+                return
+            seen_ids.add(pid)
+            pages.append(page)
+        except Exception:
+            return
+
+    # Include candidate tab/context first.
+    _add(candidate_page)
+    if candidate_page is not None:
+        try:
+            for p in candidate_page.context.pages:
+                _add(p)
+        except Exception:
+            pass
+
+    # Always include every page from every connected browser context.
+    if current_browser is not None:
+        try:
+            for ctx in current_browser.contexts:
+                for p in ctx.pages:
+                    _add(p)
+        except Exception:
+            pass
+
+    return pages
+
+
+def reset_tabs_for_session_start(page):
+    """Normalize browser tabs at startup to avoid stale-tab context issues."""
+    pages = _get_all_open_pages(page)
+    if not pages:
+        return page
+
+    preferred = None
+    # Prefer already-authenticated navigation tab.
+    for p in reversed(pages):
+        try:
+            if is_logged_in_navigation(p.url):
+                preferred = p
+                break
+        except Exception:
+            continue
+
+    # Otherwise prefer explicit login tab if present.
+    if preferred is None:
+        for p in reversed(pages):
+            try:
+                if AVAILITY_LOGIN_URL in p.url:
+                    preferred = p
+                    break
+            except Exception:
+                continue
+
+    if preferred is None:
+        preferred = pages[-1]
+
+    # Keep the selected tab and avoid destructive tab closes in default profile mode.
+    # Closing tabs in default profile can remove active user context unexpectedly.
+    log_to_gui(f"ℹ️ Using startup tab: {preferred.url}\n", "info")
+
+    try:
+        preferred.bring_to_front()
+    except Exception:
+        pass
+    return preferred
+
+
+def validate_navigation_page_ready(page, timeout_ms=5000):
+    """Validate that a candidate page is truly logged-in and fully loaded."""
+    try:
+        if page is None:
+            return False, "page is None"
+        if page.is_closed():
+            return False, "page is closed"
+
+        url = page.url
+        if not is_logged_in_navigation(url):
+            return False, "url is not navigation shell"
+
+        # Ensure document has loaded enough for shell interactions.
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 4000))
+        except Exception:
+            # networkidle may not settle on SPAs; domcontentloaded is sufficient.
+            pass
+        return True, "ready"
+    except Exception as e:
+        return False, f"navigation readiness check failed: {e}"
+
+
+def _find_logged_in_page(candidate_page):
+    """Return an authenticated, fully loaded navigation-shell page."""
+    if candidate_page is not None:
+        try:
+            ready, _ = validate_navigation_page_ready(candidate_page, timeout_ms=2000)
+            if ready:
+                return candidate_page
+        except Exception:
+            pass
+
+        pages = _get_all_open_pages(candidate_page)
+        for p in reversed(pages):
+            try:
+                ready, _ = validate_navigation_page_ready(p, timeout_ms=2000)
+                if ready:
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def wait_for_login(page, timeout_seconds=900):
+    """Wait for the user to complete login/2FA and return logged-in page object."""
+    log_to_gui("🔐 Please login to Availity and complete 2FA in Edge...\n", "info")
+    start = time.time()
+    last_log = 0
+    last_probe = 0
+
+    while is_running:
+        active_page = _find_logged_in_page(page)
+        if active_page is not None:
+            log_to_gui("✓ Login detected. Continuing automation...\n", "success")
+            return active_page
+
+        # If we are still stuck on login URL, proactively probe navigation URL.
+        # This handles auto-login/session-restore cases where URL detection lags.
+        elapsed = int(time.time() - start)
+        if elapsed - last_probe >= 20:
+            last_probe = elapsed
+            try:
+                candidate = get_live_page(page)
+                current_url = candidate.url if isinstance(candidate.url, str) else ""
+                if "availity-fr-ui/#/login" in current_url.lower():
+                    log_to_gui("  → Probing navigation shell URL...\n", "info")
+                    candidate.goto(AVAILITY_NAVIGATION_URL, wait_until="domcontentloaded", timeout=30000)
+                    page = candidate
+                    active_page = _find_logged_in_page(page)
+                    if active_page is not None:
+                        log_to_gui("✓ Session became ready after navigation probe\n", "success")
+                        return active_page
+            except Exception as probe_err:
+                log_to_gui(f"  ⚠️ Navigation probe failed: {probe_err}\n", "error")
+
+        if elapsed - last_log >= 15:
+            last_log = elapsed
+            log_to_gui("  …waiting for successful login/navigation page\n", "info")
+            open_urls = _get_open_page_urls(page)
+            if open_urls:
+                log_to_gui(f"    Open pages: {open_urls[-1]}\n", "info")
+            # Add one concise reason from current page for faster diagnosis.
+            try:
+                candidate = get_live_page(page)
+                ready, reason = validate_navigation_page_ready(candidate, timeout_ms=2000)
+                if not ready:
+                    log_to_gui(f"    Waiting reason: {reason}\n", "error")
+            except Exception as e:
+                log_to_gui(f"    Waiting reason: no live page ({e})\n", "error")
+
+        if elapsed >= timeout_seconds:
+            log_to_gui("❌ Login wait timed out. Please click Start again.\n", "error")
+            return None
+
+        time.sleep(2)
+    return None
 
 
 # ============================================================================
@@ -361,22 +690,28 @@ def load_csv(file_path):
 
 def add_output_columns(df):
     """Append OUTPUT_COLUMNS to df with empty defaults where they don't exist."""
-    for col in OUTPUT_COLUMNS:
+    for col in OUTPUT_COLUMNS + STATUS_COLUMNS:
         if col not in df.columns:
             df[col] = ''
+    df['AutomationStatus'] = df['AutomationStatus'].replace('', 'Pending').fillna('Pending')
+    df['LastError'] = df['LastError'].fillna('')
     return df
 
 
-def save_results(df, output_folder, prefix="progress"):
-    """Write df to a timestamped CSV in output_folder.
+def get_output_file_path(output_folder):
+    """Return the single fixed output file path for all progress/final saves."""
+    return os.path.join(output_folder, "Automated.csv")
+
+
+def save_results(df, output_folder):
+    """Write df to one fixed CSV in output_folder.
 
     Last_Name and First_Name are excluded from the output because they are
     derived from PatientName and are not needed by downstream consumers.
     Returns the saved file path, or None on failure.
     """
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path      = os.path.join(output_folder, f"{prefix}_{timestamp}.csv")
+        path = get_output_file_path(output_folder)
         export_df = df.drop(columns=['Last_Name', 'First_Name'], errors='ignore')
         export_df.to_csv(path, index=False)
         log_to_gui(f"  💾 Saved: {path}\n", "info")
@@ -390,6 +725,12 @@ def write_row_result(df, row_index, result_dict):
     """Apply every key/value in result_dict to the given dataframe row in-place."""
     for field, value in result_dict.items():
         df.at[row_index, field] = value
+
+
+def safe_mark_row_status(df, row_index, status, err=''):
+    """Safely update row processing status columns."""
+    df.at[row_index, 'AutomationStatus'] = status
+    df.at[row_index, 'LastError'] = err
 
 
 # ============================================================================
@@ -423,6 +764,11 @@ def navigate_to_payer_page(page, payer_config):
         page:         Playwright Page object.
         payer_config: Entry from PAYER_CONFIG for the selected payer.
     """
+    page = retry_with_backoff(
+        "Acquire live page",
+        lambda: get_live_page(page),
+        attempts=3,
+    )
     retry_with_backoff(
         "Navigate to search page",
         lambda: page.goto(payer_config['url'], wait_until='domcontentloaded', timeout=45000),
@@ -432,10 +778,16 @@ def navigate_to_payer_page(page, payer_config):
     time.sleep(3)
 
     if payer_config['uses_hipaa_tab']:
-        hipaa_tab = page.frame_locator(SELECTORS['iframe']).locator(SELECTORS['hipaa_tab'])
-        hipaa_tab.first.wait_for(state='visible', timeout=20000)
-        hipaa_tab.first.click(timeout=15000)
+        def _click_hipaa():
+            live_page = get_live_page(page)
+            hipaa_tab = live_page.frame_locator(SELECTORS['iframe']).locator(SELECTORS['hipaa_tab'])
+            hipaa_tab.first.wait_for(state='visible', timeout=20000)
+            hipaa_tab.first.click(timeout=15000)
+            return live_page
+
+        page = retry_with_backoff("Select HIPAA tab", _click_hipaa, attempts=3)
         log_to_gui("  ✓ HIPAA tab selected\n", "success")
+    return page
 
 
 # ============================================================================
@@ -457,7 +809,7 @@ def fill_search_form(iframe, row_data):
         member_id  = safe_field(row_data, 'AltPatientID')
         last_name  = safe_field(row_data, 'Last_Name')
         first_name = safe_field(row_data, 'First_Name')
-        dob        = safe_field(row_data, 'DOB')
+        dob        = normalize_dob(safe_field(row_data, 'DOB'))
         start_date = normalize_date(safe_field(row_data, 'StartDate'))
         end_date   = normalize_date(safe_field(row_data, 'EndDate'))
 
@@ -642,7 +994,7 @@ def extract_denial_codes_inline(iframe, matching_row, _row_index):
 
     The row is always collapsed after extraction (even on error) so that
     subsequent rows render correctly in the same session.
-    Returns a comma-separated string of descriptions, or '--'.
+    Returns a comma-separated string of descriptions, or '--'
     """
     expand_btn = matching_row.locator('td').first.locator('button')
     try:
@@ -874,6 +1226,17 @@ def enrich_claim_with_amounts(iframe, claim_data, row_data, payer_config):
     if payer_config['uses_line_level']:
         visit_date = safe_field(row_data, 'VisitDate')
         row, idx, billed, paid = find_line_by_visit_date(iframe, visit_date)
+        # Fallback: if line-level date match fails, use header panel amounts.
+        if (billed in ('', '--') and paid in ('', '--')) or row is None:
+            header_billed = claim_data.get('Billed Amount', '--')
+            header_paid = claim_data.get('Paid Amount', '--')
+            if header_billed not in ('', '--') or header_paid not in ('', '--'):
+                billed, paid = header_billed, header_paid
+                log_to_gui(
+                    "    ℹ️ Line-level match not found; using header billed/paid amounts\n",
+                    "info",
+                )
+
         claim_data['Billed Amount'] = billed
         claim_data['Paid Amount']   = paid
         return row, idx, billed, paid
@@ -1091,7 +1454,7 @@ def format_multi_claim_results(results):
 def process_one_row(page, df, row_index, row_data, output_folder, payer_config):
     """Full pipeline for one CSV row: navigate → search → extract → save.
 
-    Always returns True so the batch loop advances regardless of outcome.
+    Returns True on successful extraction, False on row-level failure.
     Errors are written to the dataframe and a progress file is saved
     immediately so no work is lost if the process is interrupted.
     """
@@ -1107,42 +1470,49 @@ def process_one_row(page, df, row_index, row_data, output_folder, payer_config):
         if not invoice_number:
             log_to_gui(f"  ⚠️ Row {row_index + 1}: InvoiceNumber is empty — skipping\n", "error")
             write_row_result(df, row_index, empty_claim_result('Missing InvoiceNumber'))
-            return True
+            safe_mark_row_status(df, row_index, 'Error', 'Missing InvoiceNumber')
+            save_results(df, output_folder)
+            return False
 
         log_to_gui(f"  → Invoice: {invoice_number}  |  Visit: {visit_date}\n")
 
         # Re-navigate for every row after the first to flush any stale UI state
         if row_index > 0:
-            _reload_and_navigate(page, payer_config)
+            page = _reload_and_navigate(page, payer_config)
 
         try:
             iframe = retry_with_backoff("Wait for page ready", lambda: wait_for_page_ready(page), attempts=3)
         except Exception as nav_error:
             log_to_gui(f"  ❌ Page setup failed: {nav_error}\n", "error")
             write_row_result(df, row_index, empty_claim_result('Navigation failed'))
+            safe_mark_row_status(df, row_index, 'Error', f'Navigation failed: {nav_error}')
             save_results(df, output_folder)
-            return True
+            return False
 
         if not fill_search_form(iframe, row_data):
             write_row_result(df, row_index, empty_claim_result('Form error'))
+            safe_mark_row_status(df, row_index, 'Error', 'Form error')
             save_results(df, output_folder)
-            return True
+            return False
 
         if not submit_search_and_wait(iframe):
             write_row_result(df, row_index, empty_claim_result('No claims found. Advised to search manually'))
+            safe_mark_row_status(df, row_index, 'Error', 'Search failed')
             save_results(df, output_folder)
-            return True
+            return False
 
         matching_rows, match_count = find_matching_claims(iframe, invoice_number)
         if match_count == 0:
             write_row_result(df, row_index, empty_claim_result('Claim not found. Search manually'))
+            safe_mark_row_status(df, row_index, 'Error', 'Claim not found')
             save_results(df, output_folder)
-            return True
+            return False
 
         all_results = process_all_claims_for_invoice(
             page, iframe, row_data, invoice_number, matching_rows, match_count, payer_config
         )
         write_row_result(df, row_index, format_multi_claim_results(all_results))
+        safe_mark_row_status(df, row_index, 'Done', '')
         log_to_gui(f"  ✓ Row {row_index + 1} complete\n", "success")
 
         # Brief pause between rows to let the browser settle before the next reload
@@ -1154,8 +1524,9 @@ def process_one_row(page, df, row_index, row_data, output_folder, payer_config):
         log_to_gui(f"  ❌ Row error: {e}\n", "error")
         log_to_gui(traceback.format_exc(), "error")
         write_row_result(df, row_index, empty_claim_result('Critical error'))
+        safe_mark_row_status(df, row_index, 'Error', str(e))
         save_results(df, output_folder)
-        return True
+        return False
 
 
 def _reload_and_navigate(page, payer_config):
@@ -1178,8 +1549,9 @@ def _reload_and_navigate(page, payer_config):
         log_to_gui(f"  ⚠️ Reload failed: {e}\n", "error")
 
     log_to_gui("  → Navigating to search page...\n")
-    navigate_to_payer_page(page, payer_config)
+    page = navigate_to_payer_page(page, payer_config)
     log_to_gui("  ✓ Navigation complete\n", "success")
+    return page
 
 
 # ============================================================================
@@ -1194,6 +1566,7 @@ def process_batch(batch_size, csv_path, output_folder, payer_name):
     """
     global is_running
     df = None
+    should_close_browser = False
 
     try:
         payer_config = PAYER_CONFIG.get(payer_name)
@@ -1201,13 +1574,22 @@ def process_batch(batch_size, csv_path, output_folder, payer_name):
             log_to_gui(f"❌ Unknown payer '{payer_name}'\n", "error")
             return
 
-        log_to_gui("🌐 Connecting to browser...\n", "info")
+        log_to_gui("🌐 Starting Edge browser...\n", "info")
+        if not ensure_edge_with_cdp():
+            return
+
+        log_to_gui("🌐 Connecting to browser via CDP...\n", "info")
         page = setup_browser()
+        page = reset_tabs_for_session_start(page)
         log_to_gui("✓ Browser connected\n", "success")
+
+        page = wait_for_login(page)
+        if not page:
+            return
 
         # Navigate before loading the CSV so we fail fast on browser issues
         log_to_gui("🔗 Navigating to search page...\n", "info")
-        navigate_to_payer_page(page, payer_config)
+        page = navigate_to_payer_page(page, payer_config)
         retry_with_backoff("Initial page ready", lambda: wait_for_page_ready(page), attempts=3)
         log_to_gui("✓ Initial navigation complete\n", "success")
 
@@ -1225,26 +1607,60 @@ def process_batch(batch_size, csv_path, output_folder, payer_name):
         df = add_output_columns(df)
         log_to_gui(f"✓ Loaded {len(df)} rows\n", "success")
 
-        rows_to_process = min(batch_size, len(df))
-        log_to_gui(f"\n📦 Processing {rows_to_process} rows for {payer_name}...\n", "info")
+        pending_indices = [
+            idx for idx in range(len(df))
+            if str(df.at[idx, 'AutomationStatus']).strip().lower() != 'done'
+        ]
+        target_indices = pending_indices[:batch_size]
+        rows_to_process = len(target_indices)
+
+        if rows_to_process == 0:
+            log_to_gui("✓ All rows already marked Done. Nothing to process.\n", "success")
+            should_close_browser = True
+            save_results(df, output_folder)
+            return
+
+        log_to_gui(
+            f"\n📦 Processing {rows_to_process} pending row(s) for {payer_name} "
+            f"(resume-aware)...\n",
+            "info"
+        )
         log_to_gui("-" * 60 + "\n")
 
         processed    = 0
         error_counts = {}
 
-        for idx in range(rows_to_process):
+        for idx in target_indices:
             if not is_running:
                 log_to_gui("⚠ Stopped by user\n", "error")
                 break
-            process_one_row(page, df, idx, df.iloc[idx], output_folder, payer_config)
+
+            active_page = _find_logged_in_page(page)
+            if active_page is not None:
+                page = active_page
+            ready, reason = validate_navigation_page_ready(page, timeout_ms=2500)
+            if not ready:
+                log_to_gui("⚠ Session appears logged out. Waiting for re-login...\n", "error")
+                log_to_gui(f"    Session check reason: {reason}\n", "error")
+                page = wait_for_login(page)
+                if not page:
+                    break
+                page = navigate_to_payer_page(page, payer_config)
+
+            safe_mark_row_status(df, idx, 'InProgress', '')
+            row_ok = process_one_row(page, df, idx, df.iloc[idx], output_folder, payer_config)
             processed += 1
+            if not row_ok and str(df.at[idx, 'AutomationStatus']).strip().lower() != 'error':
+                safe_mark_row_status(df, idx, 'Error', 'Unknown row processing error')
+                save_results(df, output_folder)
             _record_error(df, idx, error_counts)
 
         log_to_gui("-" * 60 + "\n")
-        save_results(df, output_folder, "FINAL_results")
+        save_results(df, output_folder)
 
         if processed == rows_to_process:
             log_to_gui(f"✓ Complete! {processed} rows processed\n", "success")
+            should_close_browser = True
         else:
             log_to_gui(f"⚠ Stopped. {processed}/{rows_to_process} rows saved\n", "error")
 
@@ -1259,7 +1675,9 @@ def process_batch(batch_size, csv_path, output_folder, payer_name):
         if df is not None:
             save_results(df, output_folder)
     finally:
-        cleanup_browser()
+        disconnect_browser_session()
+        if should_close_browser or not is_running:
+            close_managed_edge_if_owned()
         reset_ui_state()
 
 
@@ -1396,6 +1814,7 @@ def request_stop():
     """Signal the worker thread to stop after the current row completes."""
     global is_running
     is_running = False
+    close_managed_edge_if_owned()
     reset_ui_state(clear_all=True)
 
 
@@ -1435,7 +1854,7 @@ def create_gui():
     tk.Button(main_frame, text="Browse", command=browse_folder).grid(row=2, column=2, pady=5)
 
     # Row 3 — Batch size
-    tk.Label(main_frame, text="Batch Size:", font=("Arial", 10)).grid(row=3, column=0, sticky="w", pady=5)
+    tk.Label(main_frame, text="Claim Search Limit", font=("Arial", 10)).grid(row=3, column=0, sticky="w", pady=5)
     tk.Entry(main_frame, textvariable=batch_size_var, width=20).grid(row=3, column=1, sticky="w", pady=5, padx=5)
 
     # Row 4 — Payer dropdown
