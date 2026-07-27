@@ -21,7 +21,7 @@ The program processes claim-related rows from a CSV and writes enriched output f
   - Input CSV file
   - Output folder
   - Batch size
-  - Payer (Healthfirst, Integra, Villagecaremax)
+  - Payer (Healthfirst, Integra, SWHNY, Villagecaremax)
 - Start/Stop controls with a live color-coded log panel.
 - Runs automation in a background thread so the GUI remains responsive.
 
@@ -71,11 +71,12 @@ The program processes claim-related rows from a CSV and writes enriched output f
   - Reads billed/paid from line table columns.
 
 ## 7) Denial Reason Extraction (Two Paths)
-- **Inline code-based path** (Healthfirst/Integra style):
+- **Inline code-based path** (Healthfirst/Integra/SWHNY style):
   - Expands selected line
   - Reads Reason/Remark codes
   - Looks up descriptions in codes table
   - Returns combined denial text.
+  - **SWHNY fallback:** when line details have no codes, reads Reason/Remark Code from the claim info panel (`testReason/Remark CodePanel`) and resolves via the codes table.
 - **Remittance viewer path** (Villagecaremax):
   - Opens remittance viewer in new tab
   - Searches by Claim ID

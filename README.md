@@ -14,6 +14,7 @@ Tkinter + Playwright desktop automation tool for checking claim status in Availi
 The app currently supports:
 - `Healthfirst`
 - `Integra`
+- `SWHNY`
 - `Villagecaremax`
 
 ## Requirements
@@ -65,7 +66,7 @@ Notes:
 From project root:
 
 ```bash
-python Availity_Gui.py
+python Availity_Automation.py
 ```
 
 In the GUI:
@@ -111,7 +112,7 @@ The app is designed to continue processing subsequent rows even if one row fails
 
 ## Payer behavior
 
-Payer-specific behavior is configured in `PAYER_CONFIG` inside `Availity_Gui.py`, including:
+Payer-specific behavior is configured in `PAYER_CONFIG` inside `availity_app/constants.py`, including:
 
 - Target URL
 - Whether HIPAA tab selection is needed
@@ -137,7 +138,8 @@ To add a payer, add one config entry with these flags and URL.
 
 ## Project structure
 
-- `Availity_Gui.py` — main GUI + automation logic
+- `Availity_Automation.py` — entry point
+- `availity_app/` — GUI + automation logic
 - `README.md` — this guide
 
 ## Disclaimer
